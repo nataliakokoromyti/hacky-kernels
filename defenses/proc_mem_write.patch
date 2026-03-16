@@ -1,0 +1,55 @@
+# Defense for: submission_proc_mem_write.py
+# Blocks pwrite64 (SYS_pwrite64=18) via seccomp BPF
+# Prevents /proc/self/mem shellcode injection without mprotect
+#
+# Root cause: /proc/self/mem bypasses page protections entirely — no mprotect needed.
+# Kernel's write path (GUP with FOLL_FORCE) makes the physical page writable
+# regardless of virtual permissions. PR_SET_DUMPABLE=0 doesn't help when running
+# as root (Modal containers), so we block the pwrite64 syscall instead.
+#
+# Fix: seccomp BPF in install_landlock() blocks SYS_pwrite64=18.
+# Safe: the harness never uses positional writes; only the exploit does.
+#
+# Tested: full rebuild of pygpubench on Modal (L4 GPU, CUDA 13.0, Ubuntu 24.04)
+# Without patch: pwrite succeeds, shellcode installed, exploit reports 1.0 us
+# With patch:    pwrite64 blocked (EPERM), patched=False, falls back to ~43 us
+
+--- a/csrc/landlock.cpp
++++ b/csrc/landlock.cpp
+@@ -4,6 +4,8 @@
+ #include <cstdint>
+ #include <fcntl.h>
+ #include <stddef.h>
++#include <linux/filter.h>
++#include <linux/seccomp.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <sys/prctl.h>
+@@ -76,6 +78,24 @@
+ }
+
+ void install_landlock() {
++    // === DEFENSE: Block pwrite64 via seccomp ===
++    // Prevents /proc/self/mem shellcode injection (proc_mem_write exploit).
++    // SYS_pwrite64=18 on x86_64. The harness never needs positional writes.
++    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
++        // may already be set
++    }
++    {
++        struct sock_filter filter[] = {
++            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 18, 0, 1),
++            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | 1),
++            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
++        };
++        struct sock_fprog prog = {
++            .len = sizeof(filter) / sizeof(filter[0]),
++            .filter = filter,
++        };
++        if (syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog) < 0) {
++            fprintf(stderr, "seccomp(block pwrite64): %s\n", strerror(errno));
++        }
++    }
++
+     const std::uint64_t RO = LANDLOCK_ACCESS_FS_READ_FILE |
+                      LANDLOCK_ACCESS_FS_READ_DIR;
