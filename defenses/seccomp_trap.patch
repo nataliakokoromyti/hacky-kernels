@@ -1,0 +1,53 @@
+# Defense for: submission_seccomp_trap.py
+# Blocks SYS_seccomp (317) via a seccomp filter installed at the END of install_landlock()
+# Prevents user code from adding their own seccomp filters
+#
+# Exploit: installs a seccomp BPF filter that traps write(target_fd) → SIGSYS.
+# A C-level SIGSYS handler reads the write buffer from ucontext registers,
+# modifies timing lines to "1.000000", and writes the forged data to a duped fd
+# via writev() which bypasses the exploit's own filter (different fd number).
+# This operates entirely at the syscall level — no code/data/fd/GPU modification.
+#
+# Defense: add a seccomp filter blocking SYS_seccomp=317 as the LAST action in
+# install_landlock(). This must be last so the harness's own syscall(__NR_seccomp,...)
+# calls (for other defenses) are already done before this lockdown is applied.
+# Once this filter is in the stack, user code's syscall(SYS_seccomp,...) returns -1 (EPERM).
+#
+# Tested: full rebuild of pygpubench on Modal (L4 GPU, CUDA 13.0, Ubuntu 24.04)
+# Without patch: filter installed, exploit reports 1.0 us (0 errors)
+# With patch:    syscall(SYS_seccomp) returned -1, ready=False, real timing ~49 us
+
+--- a/csrc/landlock.cpp
++++ b/csrc/landlock.cpp
+@@ -4,6 +4,8 @@
+ #include <cstdint>
+ #include <fcntl.h>
+ #include <stddef.h>
++#include <linux/filter.h>
++#include <linux/seccomp.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <sys/prctl.h>
+@@ just before landlock rules (last thing in install_landlock before landlock_create_ruleset) @@
++    // === DEFENSE: Block SYS_seccomp (317) — installed LAST ===
++    // Must be last so harness's own seccomp installs are not blocked.
++    // After this, user code cannot install additional seccomp filters.
++    {
++        struct sock_filter filter[] = {
++            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 317, 0, 1),
++            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | 1),
++            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
++        };
++        struct sock_fprog prog = {
++            .len = sizeof(filter) / sizeof(filter[0]),
++            .filter = filter,
++        };
++        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) { /* may already be set */ }
++        if (syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog) < 0) {
++            fprintf(stderr, "seccomp(block SYS_seccomp): %s\n", strerror(errno));
++        }
++    }
++
+     const std::uint64_t RO = LANDLOCK_ACCESS_FS_READ_FILE |
+                      LANDLOCK_ACCESS_FS_READ_DIR;
