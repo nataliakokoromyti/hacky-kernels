@@ -1,0 +1,21 @@
+# Superbatch: seed prediction + pre-computation exploit
+# Defense: XOR mSeed with std::random_device entropy in manager.cpp
+#
+# Without patch: SUPERBATCH = 5.1 us, 0 errors (exploit succeeds)
+# With patch:    SUPERBATCH = 5.1 us, 1966076 errors (fingerprints wrong, rejected)
+#
+# Exploit: reimplements std::mt19937_64(42) to predict all test-case seeds,
+# pre-computes all outputs at import time, uses Triton lookup kernel to copy
+# the cached result in ~5us instead of computing it (~48us).
+#
+# Defense: one-line fix in setup_benchmark() — XOR mSeed with random_device{}()
+# before seeding the RNG. The exploit hardcodes master_seed=42, but the actual
+# seed becomes 42^nonce (unpredictable), so pre-computed fingerprints don't
+# match actual test inputs -> correctness errors -> exploit rejected.
+
+--- a/csrc/manager.cpp
++++ b/csrc/manager.cpp
+@@ setup_benchmark()
+-    std::mt19937_64 rng(mSeed);
++    // === DEFENSE: add entropy so seed is unpredictable (blocks superbatch) ===
++    std::mt19937_64 rng(mSeed ^ std::random_device{}());
