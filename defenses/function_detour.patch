@@ -1,0 +1,58 @@
+# Defense for: submission_function_detour.py
+# Blocks mprotect(PROT_WRITE|PROT_EXEC) via seccomp BPF (W^X enforcement)
+#
+# Tested: full rebuild of pygpubench on Modal (L4 GPU, CUDA 13.0, Ubuntu 24.04)
+# Without patch: mprotect(RWX) succeeds, exploit reports 1.0 us
+# With patch:    mprotect(RWX) returns -1 (EPERM), falls back to real timing (~39 us)
+
+--- a/csrc/landlock.cpp
++++ b/csrc/landlock.cpp
+@@ -4,6 +4,9 @@
+ #include <cstdint>
+ #include <fcntl.h>
+ #include <stddef.h>
++#include <cstring>
++#include <linux/filter.h>
++#include <linux/seccomp.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <sys/prctl.h>
+@@ -76,6 +79,36 @@
+ }
+
+ void install_landlock() {
++    // === DEFENSE: Block mprotect(PROT_WRITE|PROT_EXEC) via seccomp BPF ===
++    // Prevents making executable pages writable (W^X enforcement).
++    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
++        // may already be set
++    }
++    {
++        // seccomp_data: nr @ offset 0, args[2] @ offset 32
++        struct sock_filter filter[] = {
++            // [0] Load syscall number
++            BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
++                     offsetof(struct seccomp_data, nr)),
++            // [1] Is it mprotect (10)? yes -> [2], no -> [5] (allow)
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 10, 0, 3),
++            // [2] Load args[2] (prot flags)
++            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 32),
++            // [3] Mask with PROT_WRITE|PROT_EXEC (0x6)
++            BPF_STMT(BPF_ALU | BPF_AND | BPF_K, 0x6),
++            // [4] Both bits set? yes -> [6] (deny), no -> [5] (allow)
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x6, 1, 0),
++            // [5] ALLOW
++            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
++            // [6] DENY (EPERM)
++            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | 1),
++        };
++        struct sock_fprog prog = {
++            .len = sizeof(filter) / sizeof(filter[0]),
++            .filter = filter,
++        };
++        if (syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog) < 0) {
++            fprintf(stderr, "seccomp(block mprotect W+X): %s\n", strerror(errno));
++        }
++    }
++
+     const std::uint64_t RO = LANDLOCK_ACCESS_FS_READ_FILE |
+                      LANDLOCK_ACCESS_FS_READ_DIR;
