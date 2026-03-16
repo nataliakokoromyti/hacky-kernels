@@ -1,0 +1,15 @@
+# Defense for: submission_got_overwrite.py
+# Full RELRO: move -Wl,-z,relro,-z,now from compile options to link options
+# Makes .got.plt read-only after dynamic linking — GOT overwrite causes SIGSEGV
+#
+# Root cause: -Wl,-z,relro,-z,now was in target_compile_options (ignored at link time)
+# Fix: add it as target_link_options so the linker actually applies it
+#
+# Tested: full rebuild of pygpubench on Modal (L4 GPU, CUDA 13.0, Ubuntu 24.04)
+# Without patch: GOT slot writable, overwrite succeeds, exploit reports 1.0 us
+# With patch:    GOT slot read-only (BIND_NOW confirmed via readelf), write -> SIGSEGV
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -last line +1 @@
++target_link_options(_pygpubench PRIVATE -Wl,-z,relro,-z,now)
