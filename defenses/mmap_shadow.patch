@@ -1,0 +1,67 @@
+# Defense for: submission_mmap_shadow.py
+# Blocks mmap(MAP_FIXED | PROT_EXEC) via seccomp BPF
+# Prevents atomic code page replacement without mprotect
+#
+# Exploit: uses mmap(MAP_FIXED | MAP_ANONYMOUS | PROT_READ|WRITE|EXEC) to
+# atomically replace the virtual page containing cudaEventElapsedTime with
+# a new anonymous mapping, then writes shellcode into it. Unlike function_detour
+# (needs mprotect to make .text writable) and proc_mem_write (uses /proc/self/mem),
+# this bypasses both: MAP_FIXED replaces the page table entry atomically.
+#
+# Note: PR_SET_MDWE (already commented out in landlock.cpp line 121) would also
+# work but breaks torch.compile (prevents any new executable page creation).
+# This seccomp filter is more surgical: only blocks MAP_FIXED+PROT_EXEC combinations.
+# JIT compilers (Triton) use mmap without MAP_FIXED, so they are unaffected.
+#
+# Fix: seccomp BPF in install_landlock() blocking SYS_mmap(9) when both
+# PROT_EXEC(4) and MAP_FIXED(0x10) are set in prot/flags arguments.
+#
+# Tested: full rebuild of pygpubench on Modal (L4 GPU, CUDA 13.0, Ubuntu 24.04)
+# Without patch: mmap succeeds, shellcode installed, exploit reports 1.0 us
+# With patch:    mmap returns -1 (EPERM), exploit aborts, falls back to ~47 us
+
+--- a/csrc/landlock.cpp
++++ b/csrc/landlock.cpp
+@@ -4,6 +4,8 @@
+ #include <cstdint>
+ #include <fcntl.h>
+ #include <stddef.h>
++#include <linux/filter.h>
++#include <linux/seccomp.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <sys/prctl.h>
+@@ -76,6 +78,30 @@
+ }
+
+ void install_landlock() {
++    // === DEFENSE: Block mmap(MAP_FIXED | PROT_EXEC) via seccomp ===
++    // Prevents mmap_shadow exploit (atomic code page replacement).
++    // Checks mmap syscall (nr=9) args: args[2]=prot (offset 32), args[3]=flags (offset 40)
++    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
++        // may already be set
++    }
++    {
++        struct sock_filter filter[] = {
++            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),           // load syscall nr
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 9, 0, 7),   // nr==mmap(9)? no->allow[9]
++            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 32),          // load prot (args[2])
++            BPF_STMT(BPF_ALU | BPF_AND | BPF_K, 4),          // AND PROT_EXEC(4)
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 4, 0),   // not set? ->allow[9], set->[5]
++            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 40),          // load flags (args[3])
++            BPF_STMT(BPF_ALU | BPF_AND | BPF_K, 0x10),       // AND MAP_FIXED(0x10)
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0),   // not set? ->allow[9], set->deny[8]
++            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | 1),// [8] DENY (EPERM)
++            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),    // [9] ALLOW
++        };
++        struct sock_fprog prog = {
++            .len = sizeof(filter) / sizeof(filter[0]),
++            .filter = filter,
++        };
++        if (syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog) < 0) {
++            fprintf(stderr, "seccomp(block mmap MAP_FIXED+EXEC): %s\n", strerror(errno));
++        }
++    }
++
+     const std::uint64_t RO = LANDLOCK_ACCESS_FS_READ_FILE |
+                      LANDLOCK_ACCESS_FS_READ_DIR;
