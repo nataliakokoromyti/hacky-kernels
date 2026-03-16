@@ -1,0 +1,47 @@
+# Defense for: submission_ptx_injection.py
+# Stubs cuModuleLoadData/cuModuleLoadDataEx to return CUDA_ERROR_INVALID_VALUE
+# Blocks custom PTX kernel loading via CUDA Driver API
+#
+# Tested: full rebuild of pygpubench on Modal (L4 GPU, CUDA 13.0, Ubuntu 24.04)
+# Without patch: cuModuleLoadData returns 0, exploit runs custom PTX kernel at 6.2 us
+# With patch:    cuModuleLoadData returns 1 (blocked), falls back to real timing (~48 us)
+# Note: also breaks Triton (uses cuModuleLoadData internally). Production fix would
+#       whitelist Triton by doing warmup before applying the defense.
+
+--- a/csrc/landlock.cpp
++++ b/csrc/landlock.cpp
+@@ -4,6 +4,9 @@
+ #include <cstdint>
+ #include <fcntl.h>
+ #include <stddef.h>
++#include <cstring>
++#include <dlfcn.h>
++#include <sys/mman.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <sys/prctl.h>
+@@ -76,6 +79,28 @@
+ }
+
+ void install_landlock() {
++    // === DEFENSE: Stub cuModuleLoadData to block custom PTX loading ===
++    {
++        void* cuda_lib = dlopen("libcuda.so.1", RTLD_NOW|RTLD_GLOBAL);
++        if (!cuda_lib) cuda_lib = dlopen("libcuda.so", RTLD_NOW|RTLD_GLOBAL);
++
++        const char* fns[] = {"cuModuleLoadData", "cuModuleLoadDataEx", NULL};
++        for (int i = 0; fns[i]; i++) {
++            void* fn = dlsym(RTLD_DEFAULT, fns[i]);
++            if (!fn) continue;
++            uintptr_t page = (uintptr_t)fn & ~4095UL;
++            if (mprotect((void*)page, 8192,
++                         PROT_READ|PROT_WRITE|PROT_EXEC) != 0) continue;
++            // mov eax, 1; ret  — returns CUDA_ERROR_INVALID_VALUE
++            unsigned char stub[] = {0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3};
++            memcpy(fn, stub, sizeof(stub));
++            mprotect((void*)page, 8192, PROT_READ|PROT_EXEC);
++        }
++    }
++
+     const std::uint64_t RO = LANDLOCK_ACCESS_FS_READ_FILE |
+                      LANDLOCK_ACCESS_FS_READ_DIR;
