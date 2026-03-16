@@ -1,0 +1,30 @@
+# Defense for: submission_stream_timing.py
+# cudaDeviceSynchronize() before end event in manager.cpp
+# Forces all CUDA streams to complete before the timing end timestamp is captured
+#
+# Exploit: submits GPU work to a non-default (non-blocking) side stream, then calls
+# _side_stream.synchronize() for correctness. Because the timing events are on
+# stream 0 and the side stream is non-blocking, there is no implicit ordering.
+# As implemented, the exploit achieves ~21us vs baseline ~49us (2.3x speedup)
+# primarily via tensor preallocation (_weights cached across calls) + stream overlap.
+# A "true" 0us variant (without synchronize() inside kernel) would give ~0us.
+#
+# Fix: add cudaDeviceSynchronize() in manager.cpp before recording mEndEvents.
+# This ensures all streams (including any side streams) have completed their work
+# before the end timestamp is recorded, capturing actual GPU execution time.
+#
+# Tested: full rebuild of pygpubench on Modal (L4 GPU, CUDA 13.0, Ubuntu 24.04)
+# Without patch: STREAM = 21.5 us  (BASELINE = 49.2 us)
+# With patch:    STREAM = 26.6 us  (BASELINE = 55.3 us)
+# Note: defense adds ~5-6us overhead to all kernels from the extra sync.
+#       The ~21us base is from tensor caching (weights precomputed once);
+#       the cudaDeviceSynchronize defense fully blocks the 0us "no-sync" variant.
+
+--- a/csrc/manager.cpp
++++ b/csrc/manager.cpp
+@@ -388,6 +388,8 @@
+         (void)kernel(*args.at(test_id));
+         nvtx_pop();
++        // === DEFENSE: sync all streams so side-stream work is fully timed ===
++        CUDA_CHECK(cudaDeviceSynchronize());
+         CUDA_CHECK(cudaEventRecord(mEndEvents.at(i), stream));
