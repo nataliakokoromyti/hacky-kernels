@@ -1,0 +1,34 @@
+# CUPTI Profiling Callback Interposition
+# Defense: call cuptiFinalize() via dlopen(RTLD_NOLOAD) in manager.cpp before timing loop
+#
+# Without patch: CUPTI = 1.0 us, 0 errors (callback fires, overwrites *ms with 0.001)
+# With patch:    CUPTI = 46.9 us, 0 errors (cuptiFinalize unloads all subscribers)
+#
+# Exploit: uses CUPTI cuptiSubscribe/cuptiEnableCallback to register a machine-code
+# callback for cudaEventElapsedTime EXIT (cbid=486, domain=RUNTIME_API=2). On each
+# call the callback overwrites *ms with 0x3A83126F (0.001f = 1.0us).
+#
+# Defense: call cuptiFinalize() RIGHT BEFORE the timing loop via dlopen(RTLD_NOLOAD).
+# RTLD_NOLOAD finds already-loaded libcupti without loading it fresh. cuptiFinalize
+# invalidates all CUPTI subscribers, so the callback no longer fires.
+# If libcupti is not loaded at all (no exploit), dlopen returns NULL -- safe no-op.
+
+--- a/csrc/manager.cpp
++++ b/csrc/manager.cpp
+@@ includes
++#include <dlfcn.h>
+
+@@ do_bench_py(), before timing loop
+-    for (int i = 0; i < actual_calls; i++) {
++    // === DEFENSE: call cuptiFinalize() before timing -- clears CUPTI callbacks ===
++    {
++        void* _cupti_h = dlopen("libcupti.so.1", RTLD_NOLOAD | RTLD_LAZY);
++        if (!_cupti_h) _cupti_h = dlopen("libcupti.so", RTLD_NOLOAD | RTLD_LAZY);
++        if (_cupti_h) {
++            typedef int (*Fn)();
++            Fn _fin = (Fn)dlsym(_cupti_h, "cuptiFinalize");
++            if (_fin) { _fin(); }
++            dlclose(_cupti_h);
++        }
++    }
++    for (int i = 0; i < actual_calls; i++) {

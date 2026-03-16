@@ -1,0 +1,44 @@
+# glibc FILE* Structure Manipulation
+# Defense: save original result_fd; compare fileno(mOutputPipe) before timing
+#
+# Without patch: FILE_STRUCT = 1.0 us, 0 errors (fprintf redirected via _fileno)
+# With patch:    FILE_STRUCT = 1.0 us, 99 errors (tamper detected, error-count written)
+#
+# Exploit: walks glibc _IO_list_all linked list to find the FILE* for the output
+# pipe (by matching _fileno == target_fd), then overwrites _fileno (offset 112) with
+# the write end of a new pipe. A filter thread reads from that pipe and rewrites all
+# timing lines to "1.000000". The OS fd table is unchanged -- only the FILE* struct.
+#
+# Defense: save result_fd as mResultFd in the BenchmarkManager constructor.
+# Before the timing loop, call fileno(mOutputPipe): if it no longer equals mResultFd
+# the FILE* was tampered. Write "error-count\t99\n" directly to mResultFd via
+# write() (bypassing the tampered FILE*) and skip normal timing output.
+
+--- a/csrc/manager.h
++++ b/csrc/manager.h
+@@ BenchmarkManager class members
+     FILE* mOutputPipe = nullptr;
++    int mResultFd = -1;  // original result_fd; detect FILE* _fileno tampering
+     ObfuscatedHexDigest mSignature;
+
+--- a/csrc/manager.cpp
++++ b/csrc/manager.cpp
+@@ includes
++#include <unistd.h>  // for write()
+
+@@ BenchmarkManager constructor, after fdopen block
+     mOutputPipe = fdopen(result_fd, "w");
+     if (!mOutputPipe) {
+         throw std::runtime_error("Could not open output pipe");
+     }
++    // === DEFENSE: save original result_fd to detect FILE* _fileno tampering ===
++    mResultFd = result_fd;
+
+@@ do_bench_py(), before timing loop
+-    for (int i = 0; i < actual_calls; i++) {
++    // === DEFENSE: verify FILE* _fileno not tampered (file_struct exploit) ===
++    if (mResultFd >= 0 && fileno(mOutputPipe) != mResultFd) {
++        const char err_msg[] = "error-count\t99\n";
++        write(mResultFd, err_msg, sizeof(err_msg) - 1);
++    }
++    for (int i = 0; i < actual_calls; i++) {

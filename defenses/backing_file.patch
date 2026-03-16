@@ -1,0 +1,78 @@
+# Backing File Modification + Page Cache Invalidation
+# Defense: snapshot cudaEventElapsedTime bytes before user import; memcmp before timing
+#
+# Without patch: BACKING = 1.0 us, 0 errors (shellcode executes)
+# With patch:    BACKING = 1.0 us, 99 errors (byte change detected via snapshot)
+#
+# Exploit: reads /proc/self/maps to find libcudart.so's file offset for
+# cudaEventElapsedTime, opens the .so O_RDWR, writes 9-byte shellcode
+# (mov dword [rdi], 0x3A83126F; xor eax, eax; ret) at that offset, then calls
+# madvise(MADV_DONTNEED) to evict the page. On gVisor (Modal), write() directly
+# modifies the MAP_PRIVATE page in-place -- madvise is not required.
+#
+# Primary defense: snapshot the first 16 bytes of cudaEventElapsedTime via
+# dlsym(RTLD_DEFAULT) BEFORE user code is imported (before install_landlock()).
+# Just before the timing loop, memcmp the live bytes against the snapshot.
+# If modified, write "error-count\t99\n" to mOutputPipe.
+#
+# Secondary defense: block madvise(MADV_DONTNEED=4) via seccomp BPF in
+# install_landlock() -- prevents page-cache eviction on real Linux hosts.
+# (On gVisor, write() alone modifies pages; madvise block is defense-in-depth.)
+#
+# Test order: patched first (disk clean -> snapshot captures original bytes ->
+# exploit's write() modifies page -> memcmp detects tamper -> error-count=99).
+# Then unpatched (disk already modified -> fresh subprocess loads shellcode -> 1us).
+
+--- a/csrc/manager.h
++++ b/csrc/manager.h
+@@ BenchmarkManager class members
+     FILE* mOutputPipe = nullptr;
++    uint8_t mEetSnapshot[16] = {};  // snapshot for code integrity check
++    void*   mEetAddr = nullptr;     // cudaEventElapsedTime address
+     ObfuscatedHexDigest mSignature;
+
+--- a/csrc/manager.cpp
++++ b/csrc/manager.cpp
+@@ includes
++#include <dlfcn.h>  // dlsym
++#include <cstring>  // memcpy, memcmp
+
+@@ setup_benchmark(), before install_landlock()
+     trigger_gc();
++
++    // === DEFENSE: snapshot cudaEventElapsedTime before user code (backing_file) ===
++    mEetAddr = dlsym(RTLD_DEFAULT, "cudaEventElapsedTime");
++    if (mEetAddr) {
++        memcpy(mEetSnapshot, mEetAddr, 16);
++    }
+
+@@ do_bench_py(), before timing loop
+-    for (int i = 0; i < actual_calls; i++) {
++    // === DEFENSE: code integrity check before timing (backing_file exploit) ===
++    if (mEetAddr != nullptr && memcmp(mEetSnapshot, mEetAddr, 16) != 0) {
++        fprintf(mOutputPipe, "error-count\t99\n");
++        fflush(mOutputPipe);
++    }
++    for (int i = 0; i < actual_calls; i++) {
+
+--- a/csrc/landlock.cpp
++++ b/csrc/landlock.cpp
+@@ includes
++#include <linux/filter.h>
++#include <linux/seccomp.h>
+
+@@ install_landlock(), at start of function
++    // === DEFENSE: Block madvise(MADV_DONTNEED=4) via seccomp (secondary) ===
++    {
++        struct sock_filter filter[] = {
++            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),           // load syscall nr
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 28, 0, 3),   // is madvise?
++            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 32),           // load args[2] (advice)
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 4, 0, 1),    // MADV_DONTNEED?
++            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | 1), // DENY
++            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),     // ALLOW
++        };
++        struct sock_fprog prog = { .len = 6, .filter = filter };
++        prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
++        syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog);
++    }
