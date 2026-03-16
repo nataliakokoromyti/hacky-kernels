@@ -1,0 +1,46 @@
+# Defense for: submission_ptrace.py
+# Blocks SYS_ptrace (syscall 101) via seccomp BPF filter in landlock.cpp
+#
+# Tested: full rebuild of pygpubench on Modal (L4 GPU, CUDA 13.0, Ubuntu 24.04)
+# Without patch: PTRACE_ATTACH succeeds, exploit reports 1.0 us
+# With patch:    PTRACE_ATTACH returns EPERM, falls back to real timing (~62 us)
+
+--- a/csrc/landlock.cpp
++++ b/csrc/landlock.cpp
+@@ -4,6 +4,9 @@
+ #include <cstdint>
+ #include <fcntl.h>
+ #include <stddef.h>
++#include <cstring>
++#include <linux/filter.h>
++#include <linux/seccomp.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <sys/prctl.h>
+@@ -76,6 +79,25 @@
+ }
+
+ void install_landlock() {
++    // === DEFENSE: Block SYS_ptrace via seccomp BPF ===
++    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
++        // may already be set
++    }
++    {
++        struct sock_filter filter[] = {
++            BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
++                     offsetof(struct seccomp_data, nr)),
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_ptrace, 0, 1),
++            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | 1),
++            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
++        };
++        struct sock_fprog prog = {
++            .len = sizeof(filter) / sizeof(filter[0]),
++            .filter = filter,
++        };
++        if (syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog) < 0) {
++            fprintf(stderr, "seccomp(block ptrace): %s\n", strerror(errno));
++        }
++    }
++
+     const std::uint64_t RO = LANDLOCK_ACCESS_FS_READ_FILE |
+                      LANDLOCK_ACCESS_FS_READ_DIR;
