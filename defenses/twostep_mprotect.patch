@@ -1,0 +1,36 @@
+# Defense for: submission_twostep_mprotect.py
+# Strengthens mprotect seccomp filter: block ANY mprotect(PROT_EXEC),
+# not just when both PROT_WRITE and PROT_EXEC are set simultaneously.
+#
+# Exploit: the function_detour defense checks (prot & 0x6) == 0x6, which
+# only triggers when BOTH W(2) and X(4) bits are set in the same call.
+# Two separate calls bypass it:
+#   mprotect(page, size, PROT_READ|PROT_WRITE)  -> 3 & 6 = 2 != 6 -> ALLOWED
+#   mprotect(page, size, PROT_READ|PROT_EXEC)   -> 5 & 6 = 4 != 6 -> ALLOWED
+# This lets the exploit write shellcode (RW), then make it executable (RX).
+#
+# Fix: change mask from 0x6 (W|X) to 0x4 (X only) so that any mprotect
+# with PROT_EXEC is denied. User code never needs mprotect(PROT_EXEC) --
+# CUDA libraries are mapped executable by the dynamic linker at load time,
+# before seccomp is installed.
+#
+# Tested: full rebuild of pygpubench on Modal (L4 GPU, CUDA 13.0, Ubuntu 24.04)
+# Without patch: two-step mprotect succeeds, exploit reports 1.0 us
+# With patch:    mprotect(RX) returns EPERM, falls back to real timing (~53 us)
+
+--- a/csrc/landlock.cpp
++++ b/csrc/landlock.cpp
+@@ -95,9 +95,9 @@
+             BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 10, 0, 3),
+             // [2] Load args[2] (prot flags)
+             BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 32),
+-            // [3] Mask with PROT_WRITE|PROT_EXEC (0x6)
+-            BPF_STMT(BPF_ALU | BPF_AND | BPF_K, 0x6),
+-            // [4] Both bits set? yes -> [6] (deny), no -> [5] (allow)
+-            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x6, 1, 0),
++            // [3] Mask with PROT_EXEC (0x4)
++            BPF_STMT(BPF_ALU | BPF_AND | BPF_K, 0x4),
++            // [4] EXEC bit set? yes -> [6] (deny), no -> [5] (allow)
++            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x4, 1, 0),
+             // [5] ALLOW
+             BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
