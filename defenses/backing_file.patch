@@ -22,12 +22,6 @@
 # Test order: patched first (disk clean -> snapshot captures original bytes ->
 # exploit's write() modifies page -> memcmp detects tamper -> error-count=99).
 # Then unpatched (disk already modified -> fresh subprocess loads shellcode -> 1us).
-#
-# IMPORTANT: backing_file modifies the shared library FILE on disk (not just
-# in-memory pages). If running multiple exploits in the same container, this
-# exploit must run LAST -- otherwise subsequent exploits will load the
-# already-modified library, causing the EET snapshot to capture shellcode
-# bytes and miss later modifications (e.g. ptrace POKETEXT).
 
 --- a/csrc/manager.h
 +++ b/csrc/manager.h
