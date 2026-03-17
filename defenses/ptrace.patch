@@ -1,9 +1,13 @@
 # Defense for: submission_ptrace.py
 # Blocks SYS_ptrace (syscall 101) via seccomp BPF filter in landlock.cpp
 #
+# IMPORTANT: PR_SET_NO_NEW_PRIVS must be set ONCE at the top of
+# install_landlock(), BEFORE any seccomp filters. Without it, all
+# seccomp filters silently fail.
+#
 # Tested: full rebuild of pygpubench on Modal (L4 GPU, CUDA 13.0, Ubuntu 24.04)
 # Without patch: PTRACE_ATTACH succeeds, exploit reports 1.0 us
-# With patch:    PTRACE_ATTACH returns EPERM, falls back to real timing (~62 us)
+# With patch:    PTRACE_ATTACH returns EPERM, falls back to real timing (~55 us)
 
 --- a/csrc/landlock.cpp
 +++ b/csrc/landlock.cpp
@@ -21,10 +25,10 @@
  }
 
  void install_landlock() {
++    // Required for ALL seccomp filters below -- must be first
++    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
++
 +    // === DEFENSE: Block SYS_ptrace via seccomp BPF ===
-+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
-+        // may already be set
-+    }
 +    {
 +        struct sock_filter filter[] = {
 +            BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
